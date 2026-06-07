@@ -1,8 +1,15 @@
 """
 video_ocr_search.py
 -------------------
-Extract a frame every N seconds from one or more video files,
+Extract a frame every N seconds from one or more video files or directories,
 run OCR on each frame, and stop the moment a keyword is found.
+
+Inputs can be any mix of:
+  - individual video file paths
+  - directories (scanned for video files; use --recursive for subdirectories)
+
+Non-video files inside directories are silently skipped — ffprobe is used to
+confirm each file actually contains a video stream before it is processed.
 
 Dependencies:
     pip install pillow pytesseract
@@ -169,6 +176,125 @@ def get_video_duration(video_path: str) -> float:
 
 
 # ---------------------------------------------------------------------------
+# Video file validation
+# ---------------------------------------------------------------------------
+
+
+def is_video_file(path: str) -> bool:
+    """
+    Return True if `path` contains at least one video stream, according to
+    ffprobe.
+
+    Why ffprobe instead of checking file extensions?
+    -------------------------------------------------
+    Extensions are unreliable: a `.mp4` could be audio-only, a `.dat` could
+    be a video, and users often have mixed directories with images, subtitles,
+    NFO files, and thumbnails sitting alongside actual videos.
+
+    ffprobe reads the container's stream metadata — a fast operation that does
+    not decode any media — and tells us definitively whether a video stream
+    exists.  We ask it to count video streams (`select=v`) and check that the
+    count is at least 1.
+
+    The call is intentionally lightweight:
+      -read_intervals "%+#1"  → read only the first packet's worth of data
+      -show_streams           → emit stream metadata
+      -select_streams v:0     → only the first video stream (if any)
+    If ffprobe returns no output or exits non-zero, we treat the file as
+    non-video and skip it without raising an exception.
+    """
+    cmd = [
+        "ffprobe",
+        "-v",
+        "error",  # suppress all info except errors
+        "-select_streams",
+        "v:0",  # look only at the first video stream
+        "-show_entries",
+        "stream=codec_type",
+        "-of",
+        "default=noprint_wrappers=1:nokey=1",
+        "-read_intervals",
+        "%+#1",  # read just enough to find stream info
+        path,
+    ]
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    # ffprobe prints "video" if a video stream was found; nothing otherwise.
+    return result.stdout.strip() == "video"
+
+
+# ---------------------------------------------------------------------------
+# Input resolution (files + directories → validated video list)
+# ---------------------------------------------------------------------------
+
+
+def resolve_inputs(raw_inputs: list[str], recursive: bool = False) -> list[Path]:
+    """
+    Accept a mixed list of file paths and directory paths; return an ordered
+    list of Path objects that ffprobe has confirmed are video files.
+
+    Processing rules:
+    -----------------
+    - A plain file path: validated with is_video_file(); kept or skipped.
+    - A directory path: all files inside are collected (recursively if
+      --recursive is set), sorted alphabetically, then each is validated.
+    - Anything that doesn't exist: a warning is printed and it's skipped.
+
+    Why sort directory contents?
+    ----------------------------
+    os.scandir / glob return files in filesystem order, which is essentially
+    arbitrary on most systems.  Alphabetical order means episode01.mp4 is
+    always scanned before episode02.mp4, making results reproducible.
+    """
+    resolved: list[Path] = []
+
+    for raw in raw_inputs:
+        p = Path(raw)
+
+        if not p.exists():
+            print(f"[SKIP] Not found: {p}")
+            continue
+
+        if p.is_file():
+            # Single file — validate and add.
+            if is_video_file(str(p)):
+                resolved.append(p)
+            else:
+                print(f"[SKIP] No video stream detected: {p}")
+
+        elif p.is_dir():
+            # Directory — collect all files, sort, validate each.
+            pattern = "**/*" if recursive else "*"
+            candidates = sorted(f for f in p.glob(pattern) if f.is_file())
+
+            if not candidates:
+                print(f"[SKIP] Directory is empty: {p}")
+                continue
+
+            print(
+                f"[DIR]  {p}  — found {len(candidates)} file(s), "
+                "checking for video streams…"
+            )
+
+            valid_count = 0
+            for candidate in candidates:
+                if is_video_file(str(candidate)):
+                    resolved.append(candidate)
+                    valid_count += 1
+                else:
+                    # Print only in verbose-ish context; always skip silently
+                    # to avoid spamming when a directory has many non-video files.
+                    pass
+
+            print(f"         {valid_count} video file(s) will be scanned.")
+
+        else:
+            # Symlinks to devices, sockets, etc. — just skip.
+            print(f"[SKIP] Not a regular file or directory: {p}")
+
+    return resolved
+
+
+# ---------------------------------------------------------------------------
 # Per-video search
 # ---------------------------------------------------------------------------
 
@@ -268,13 +394,16 @@ def check_dependencies() -> None:
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="OCR video frames every N seconds and stop when a keyword is found.",
+        description=(
+            "OCR video frames every N seconds and stop when a keyword is found.\n"
+            "Inputs can be individual video files, directories, or a mix of both."
+        ),
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     parser.add_argument(
-        "videos",
+        "inputs",
         nargs="+",
-        help="One or more video file paths to search.",
+        help="Video file(s) and/or director(ies) to search.",
     )
     parser.add_argument(
         "-k",
@@ -288,6 +417,12 @@ def main() -> None:
         type=float,
         default=10.0,
         help="Seconds between sampled frames.",
+    )
+    parser.add_argument(
+        "-r",
+        "--recursive",
+        action="store_true",
+        help="When a directory is given, also search subdirectories.",
     )
     parser.add_argument(
         "--no-whole-word",
@@ -304,17 +439,28 @@ def main() -> None:
 
     check_dependencies()
 
+    # Expand directories and validate all inputs via ffprobe before scanning
+    # anything.  This surfaces problems (empty dirs, no video files) upfront
+    # rather than mid-run, and gives the user a clear picture of what will
+    # actually be scanned.
+    print("Resolving inputs…")
+    video_paths = resolve_inputs(args.inputs, recursive=args.recursive)
+
+    if not video_paths:
+        sys.exit(
+            "\n✗  No valid video files found in the provided inputs.\n"
+            "   Make sure ffprobe can open the files and they contain a video stream."
+        )
+
+    print(f"\n{len(video_paths)} video(s) queued for scanning.\n")
+
     whole_word = not args.no_whole_word
     found = False
 
-    for video_path in args.videos:
-        if not Path(video_path).exists():
-            print(f"[SKIP] File not found: {video_path}")
-            continue
-
-        print(f"\n[→] Scanning: {video_path}")
+    for idx, video_path in enumerate(video_paths, start=1):
+        print(f"[{idx}/{len(video_paths)}] Scanning: {video_path}")
         match = search_video(
-            video_path=video_path,
+            video_path=str(video_path),
             keyword=args.keyword,
             interval=args.interval,
             whole_word=whole_word,
@@ -334,13 +480,13 @@ def main() -> None:
                 print(f"  {line}")
             print(f"  {'-'*40}")
             found = True
-            break  # ← stop processing remaining videos
+            break  # stop processing remaining videos
         else:
-            print(f"  Keyword not found in {video_path}.")
+            print(f"  Keyword not found.\n")
 
     if not found:
         print(
-            f'\n✗  Keyword "{args.keyword}" was not found in any of the provided videos.'
+            f'\n✗  Keyword "{args.keyword}" was not found in any of the {len(video_paths)} scanned video(s).'
         )
         sys.exit(1)
 
