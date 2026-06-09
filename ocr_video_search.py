@@ -1,29 +1,3 @@
-"""
-video_ocr_search.py
--------------------
-Extract a frame every N seconds from one or more video files or directories,
-run OCR on each frame, and stop the moment a keyword is found.
-
-Inputs can be any mix of:
-  - individual video file paths
-  - directories (scanned for video files; use --recursive for subdirectories)
-
-Non-video files inside directories are silently skipped — ffprobe is used to
-confirm each file actually contains a video stream before it is processed.
-
-Dependencies:
-    pip install pillow pytesseract
-    System: ffmpeg, tesseract-ocr
-
-    Ubuntu/Debian:
-        sudo apt install ffmpeg tesseract-ocr
-    macOS (Homebrew):
-        brew install ffmpeg tesseract
-    Windows:
-        - ffmpeg: https://ffmpeg.org/download.html
-        - Tesseract: https://github.com/UB-Mannheim/tesseract/wiki
-"""
-
 import subprocess
 import sys
 import io
