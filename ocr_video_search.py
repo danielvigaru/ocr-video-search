@@ -1,8 +1,9 @@
-import subprocess
-import sys
+import argparse
 import io
 import re
-import argparse
+import shutil
+import subprocess
+import sys
 from pathlib import Path
 
 # Pillow and pytesseract are only needed at runtime, not import time,
@@ -350,11 +351,7 @@ def format_timestamp(seconds: float) -> str:
 def check_dependencies() -> None:
     """Fail fast if ffmpeg/ffprobe/tesseract are not on PATH."""
     for tool in ("ffmpeg", "ffprobe", "tesseract"):
-        result = subprocess.run(
-            ["which", tool],  # use `where` on Windows
-            capture_output=True,
-        )
-        if result.returncode != 0:
+        if shutil.which(tool) is None:
             sys.exit(
                 f"Required tool not found on PATH: {tool}\n"
                 "Install it and make sure it's accessible from your terminal."
